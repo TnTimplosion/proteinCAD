@@ -203,3 +203,10 @@ untouched).
   from the ideal geometry only.
 - No export of design masks (fixed / designable positions for ProteinMPNN); the template is the
   structure alone.
+
+## Licence
+
+MIT — see [LICENSE](LICENSE). Use it, change it, fork it.
+
+The test structure `tests/1crn.pdb` is [PDB entry 1CRN](https://www.rcsb.org/structure/1CRN),
+redistributed from the public RCSB archive.
