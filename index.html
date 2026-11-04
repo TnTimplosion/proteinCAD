@@ -1,0 +1,140 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Protein CAD</title>
+<link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+<div id="app">
+  <header id="toolbar">
+    <div class="brand">Protein CAD</div>
+    <div class="group">
+      <button id="bNew" title="New empty model">New</button>
+      <button id="bOpen" title="Open a .pdb / .cif file, replacing the model">Open…</button>
+      <button id="bImport" title="Add the chains of a .pdb / .cif file to the current model">Import…</button>
+      <div class="menu">
+        <button id="bExport" title="Save the model">Export ▾</button>
+        <div class="menu-pop" id="exportMenu">
+          <button data-export="pdb">PDB (.pdb)</button>
+          <button data-export="cif">mmCIF (.cif)</button>
+          <label class="check"><input type="checkbox" id="exBackbone"> Backbone atoms only (N CA C O)</label>
+          <label class="check"><input type="checkbox" id="exLigands" checked> Include ligands</label>
+        </div>
+      </div>
+      <input type="file" id="fileInput" accept=".pdb,.ent,.cif,.mmcif,.txt" hidden>
+    </div>
+    <div class="group">
+      <button id="bUndo" title="Undo (Ctrl+Z)">↶</button>
+      <button id="bRedo" title="Redo (Ctrl+Y)">↷</button>
+    </div>
+    <div class="group tools" id="toolButtons">
+      <button data-tool="select" title="Select, move and rotate (S)">⬚ Select</button>
+      <button data-tool="helix" title="Extrude an α-helix from the sketch plane (H)">⌇ Helix</button>
+      <button data-tool="sheet" title="Lay a β-sheet on the sketch plane (B)">⇉ Sheet</button>
+      <button data-tool="draw" title="Draw a path and turn it into a loop (D)">✎ Draw loop</button>
+    </div>
+    <div class="group">
+      <button id="bConnect" title="Connect two chain ends with a loop, or rebuild the stretch between two residues of one chain (C)">⌒ Connect</button>
+      <button id="bRefine" title="Regularise the selected residues: ideal bond lengths and angles, no clashes, small chain breaks closed (R)">✦ Refine</button>
+      <button id="bDelete" title="Delete selected residues (Del)">✕ Delete</button>
+    </div>
+    <div class="group right">
+      <button id="bFit" title="Fit view (F)">Fit</button>
+      <button data-view="front" title="Look along +Y (Z up)">Front</button>
+      <button data-view="top" title="Look down −Z">Top</button>
+      <button data-view="right" title="Look along −X (Z up)">Right</button>
+      <button data-view="iso" title="Isometric">Iso</button>
+      <button id="bOrtho" title="Toggle orthographic projection">Persp</button>
+      <button id="bHelp" title="Mouse and keyboard reference">?</button>
+    </div>
+  </header>
+
+  <aside id="left">
+    <section>
+      <h2>Chains</h2>
+      <div id="chainList"></div>
+    </section>
+    <section id="chainOps"></section>
+    <section>
+      <h2>Display</h2>
+      <div class="grid2">
+        <label>Cartoon</label><input type="checkbox" id="dCartoon" checked>
+        <label>Atoms</label>
+        <select id="dAtoms"><option value="all">All</option><option value="backbone">Backbone + CB</option><option value="none">None</option></select>
+        <label>Style</label>
+        <select id="dStyle"><option value="sticks">Sticks</option><option value="ball">Ball &amp; stick</option></select>
+        <label>CA trace</label><input type="checkbox" id="dTrace">
+        <label>Colour</label>
+        <select id="dColor"><option value="chain">Chain</option><option value="ss">Secondary structure</option><option value="element">Element</option></select>
+        <label>Chain breaks</label><input type="checkbox" id="dBreaks" checked>
+        <label>Clashes</label><input type="checkbox" id="dClashes" checked>
+        <label>Labels</label><input type="checkbox" id="dLabels" checked>
+        <label>Axes</label><input type="checkbox" id="dAxes" checked>
+      </div>
+    </section>
+  </aside>
+
+  <main id="viewport">
+    <canvas id="gl"></canvas>
+    <canvas id="overlay"></canvas>
+    <div id="hud"></div>
+    <div id="hint"></div>
+    <div id="busy" hidden>Working…</div>
+  </main>
+
+  <aside id="right">
+    <section id="toolPanel"></section>
+    <section id="planePanel"></section>
+    <section id="inspector"></section>
+  </aside>
+
+  <section id="seq"><div id="seqInner"></div></section>
+  <footer id="status"><span id="msg">Ready.</span><span id="counts"></span></footer>
+</div>
+
+<div id="help" hidden>
+  <div class="help-card">
+    <button class="close" id="helpClose">×</button>
+    <h2>Mouse</h2>
+    <table>
+      <tr><td>Left-drag on empty space</td><td>Orbit (Select tool)</td></tr>
+      <tr><td>Right-drag</td><td>Orbit (any tool)</td></tr>
+      <tr><td>Middle-drag, Shift + right-drag</td><td>Pan</td></tr>
+      <tr><td>Wheel</td><td>Zoom</td></tr>
+      <tr><td>Click residue</td><td>Select (expands to element / chain per the selection mode)</td></tr>
+      <tr><td>Ctrl-click / Shift-click</td><td>Toggle / extend the range along the chain</td></tr>
+      <tr><td>Double-click residue</td><td>Select its helix, strand or loop</td></tr>
+      <tr><td>Shift-drag on empty space</td><td>Box select (Ctrl + Shift-drag removes)</td></tr>
+      <tr><td>Gizmo arrows / rings / centre</td><td>Move along an axis / rotate about it / move in the view plane. Hold Ctrl to snap</td></tr>
+    </table>
+    <h2>Keys</h2>
+    <table>
+      <tr><td>S H B D</td><td>Select, Helix, Sheet, Draw loop tools</td></tr>
+      <tr><td>C</td><td>Connect selected ends with a loop</td></tr>
+      <tr><td>R</td><td>Refine (regularise) the selected residues</td></tr>
+      <tr><td>F</td><td>Fit view to the selection (or everything)</td></tr>
+      <tr><td>L</td><td>Toggle gizmo axes world / local</td></tr>
+      <tr><td>Del</td><td>Delete selected residues</td></tr>
+      <tr><td>Ctrl+A, Esc</td><td>Select all, clear selection / leave a tool</td></tr>
+      <tr><td>Ctrl+Z, Ctrl+Y</td><td>Undo, redo</td></tr>
+      <tr><td>Ctrl+D</td><td>Duplicate the selection as a new chain</td></tr>
+    </table>
+  </div>
+</div>
+
+<script src="js/vec.js"></script>
+<script src="js/geom.js"></script>
+<script src="js/model.js"></script>
+<script src="js/builders.js"></script>
+<script src="js/refine.js"></script>
+<script src="js/pack.js"></script>
+<script src="js/io.js"></script>
+<script src="js/render.js"></script>
+<script src="js/app.js"></script>
+<script src="js/tools.js"></script>
+<script src="js/panels.js"></script>
+<script src="js/main.js"></script>
+</body>
+</html>

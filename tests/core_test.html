@@ -1,0 +1,515 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Protein CAD core tests</title>
+<style>
+  body { font: 13px system-ui, sans-serif; background: #1b1e24; color: #d7dce4; padding: 16px; }
+  .ok { color: #5bc77a; } .fail { color: #ef5b5b; font-weight: 600; }
+  td { padding: 2px 10px 2px 0; vertical-align: top; } td.d { color: #8b94a3; }
+</style>
+</head>
+<body>
+<h1>Protein CAD — core geometry tests</h1>
+<p id="summary">Running…</p>
+<table id="out"></table>
+<script src="../js/vec.js"></script>
+<script src="../js/geom.js"></script>
+<script src="../js/model.js"></script>
+<script src="../js/builders.js"></script>
+<script src="../js/refine.js"></script>
+<script src="../js/pack.js"></script>
+<script src="../js/io.js"></script>
+<script>
+'use strict';
+const results = [];
+function check(name, ok, detail) { results.push({ name, ok: !!ok, detail: detail || '' }); }
+const near = (a, b, tol) => Math.abs(a - b) <= tol;
+const P = Geom.pos;
+
+function bondsOK(chain) {
+  // Peptide C-N 1.33, N-CA 1.458, CA-C 1.525 everywhere.
+  let worst = 0;
+  chain.residues.forEach((r, i) => {
+    worst = Math.max(worst, Math.abs(V.dist(P(r, 'N'), P(r, 'CA')) - 1.458), Math.abs(V.dist(P(r, 'CA'), P(r, 'C')) - 1.525));
+    const n = chain.residues[i + 1];
+    if (n) worst = Math.max(worst, Math.abs(V.dist(P(r, 'C'), P(n, 'N')) - 1.329));
+  });
+  return worst;
+}
+
+async function run() {
+  // 1. NeRF / dihedral round trip
+  {
+    const a = [0.3, -1.2, 0.7], b = [1.1, 0.2, -0.4], c = [2.2, 0.9, 0.5];
+    let worst = 0;
+    for (const tor of [-170, -60, 0, 45, 120, 179]) {
+      const d = Geom.place(a, b, c, 1.5, 112, tor);
+      worst = Math.max(worst, Math.abs(V.wrap(V.dihedral(a, b, c, d) - tor)), Math.abs(V.dist(c, d) - 1.5), Math.abs(V.angle(b, c, d) - 112));
+    }
+    check('NeRF places bond, angle, torsion exactly', worst < 1e-6, 'max error ' + worst.toExponential(1));
+  }
+  // 2. Ideal alpha helix
+  {
+    const res = Geom.residuesFromBackbone(Geom.idealSegment(12, Geom.CONF.alpha).bb, 'ALA', 'H');
+    const m = Model.create(); const ch = Model.addChain(m, res);
+    const f = Model.phi(ch, 5), s = Model.psi(ch, 5), w = Model.omega(ch, 5);
+    check('Helix phi/psi/omega as built', near(f, -57.8, 1e-6) && near(s, -47, 1e-6) && near(Math.abs(w), 180, 1e-6), `φ ${f.toFixed(2)} ψ ${s.toFixed(2)} ω ${w.toFixed(1)}`);
+    const ax = Geom.screwAxis({ N: P(res[3], 'N'), CA: P(res[3], 'CA'), C: P(res[3], 'C') }, { N: P(res[4], 'N'), CA: P(res[4], 'CA'), C: P(res[4], 'C') });
+    check('Helix rise 1.5 Å, 3.6 residues/turn', near(ax.rise, 1.5, 0.08) && near(Math.abs(ax.turn), 100, 3), `rise ${ax.rise.toFixed(3)} Å, ${ax.turn.toFixed(1)}°/res`);
+    const ca = res.map(r => P(r, 'CA'));
+    const v0 = V.sub(ca[1], ca[0]), v1 = V.sub(ca[2], ca[1]), v2 = V.sub(ca[3], ca[2]);
+    check('Helix is right-handed', V.dot(V.cross(v0, v1), v2) > 0);
+    const rad = ca.map(p => V.dist(p, Geom.projectOnAxis(p, ax)));
+    check('Screw axis: every CA 2.3 Å from it', rad.every(r => near(r, 2.3, 0.05)), 'radii ' + Math.min(...rad).toFixed(3) + '–' + Math.max(...rad).toFixed(3));
+    // Carbonyl O of i should H-bond N of i+4.
+    const hb = V.dist(P(res[2], 'O'), P(res[6], 'N'));
+    check('Helix O(i)…N(i+4) H-bond distance', hb > 2.7 && hb < 3.2, hb.toFixed(2) + ' Å');
+  }
+  // 3. CB chirality against the ProteinMPNN virtual-CB formula (from real L-proteins)
+  {
+    const bb = Geom.idealSegment(5, Geom.CONF.antiparallel).bb[2];
+    const b = V.sub(bb.CA, bb.N), c = V.sub(bb.C, bb.CA), a = V.cross(b, c);
+    const ref = V.add(V.add(V.add(V.scale(a, -0.58273431), V.scale(b, 0.56802827)), V.scale(c, -0.54067466)), bb.CA);
+    const d = V.dist(ref, Geom.idealCB(bb.N, bb.CA, bb.C));
+    check('CB is L-chirality (matches ProteinMPNN virtual CB)', d < 0.05, d.toFixed(3) + ' Å apart');
+  }
+  // 4. All side chains: bonded geometry sane, nothing overlapping
+  {
+    const bad = [];
+    for (const name of Geom.AA_NAMES) {
+      const r = Geom.residuesFromBackbone(Geom.idealSegment(3, Geom.CONF.antiparallel).bb, name, 'E')[1];
+      const lib = Geom.SC[name];
+      const expect = 4 + (name === 'GLY' ? 0 : 1) + lib.atoms.length;
+      if (r.atoms.length !== expect) bad.push(name + ' atom count');
+      for (let i = 0; i < r.atoms.length; i++) for (let j = i + 1; j < r.atoms.length; j++) {
+        const d = V.dist(r.atoms[i].p, r.atoms[j].p);
+        if (d < 1.15) bad.push(name + ' ' + r.atoms[i].name + '-' + r.atoms[j].name + ' ' + d.toFixed(2));
+      }
+      if (name === 'PRO') { const d = V.dist(P(r, 'CD'), P(r, 'N')); if (d > 1.65) bad.push('PRO CD-N ' + d.toFixed(2)); }
+      if (name === 'PHE' || name === 'TYR') { const d = V.dist(P(r, 'CE1'), P(r, 'CZ')); if (Math.abs(d - 1.39) > 0.05) bad.push(name + ' ring ' + d.toFixed(2)); }
+      if (name === 'TRP') { const d = V.dist(P(r, 'NE1'), P(r, 'CE2')); if (d > 1.5) bad.push('TRP 5-ring ' + d.toFixed(2)); }
+      if (name === 'HIS') { const d = V.dist(P(r, 'CE1'), P(r, 'NE2')); if (d > 1.5) bad.push('HIS ring ' + d.toFixed(2)); }
+    }
+    check('20 side chains build with closed rings and no overlaps', !bad.length, bad.join('; ') || 'all 20 ok');
+  }
+  // 5. Kabsch
+  {
+    const pts = [[1, 2, 3], [-2, 0.5, 1], [0, -3, 2], [4, 1, -1], [2, 2, 2]];
+    const R = V.rotAxis([0.3, -0.5, 0.8], 73), t = [5, -2, 9];
+    const ys = pts.map(p => V.add(V.m3vec(R, p), t));
+    const fit = V.kabsch(pts, ys);
+    const err = Math.max(...pts.map((p, i) => V.dist(V.add(V.m3vec(fit.R, p), fit.t), ys[i])));
+    check('Kabsch recovers a rigid motion', err < 1e-8, err.toExponential(1));
+  }
+  // 6. Helix extrusion lands on the plane, along the normal
+  {
+    const base = [3, -4, 2], dir = V.norm([1, 1, 2]);
+    const res = Builders.helix({ n: 15, conf: Geom.CONF.alpha, base, dir, inPlane: V.anyPerp(dir), phase: 0, name: 'ALA' });
+    const ca = res.map(r => P(r, 'CA'));
+    const p = V.pca(ca);
+    const along = Math.abs(V.dot(p.axes[0], dir));
+    const h0 = V.dot(V.sub(ca[0], base), dir), h1 = V.dot(V.sub(ca[14], base), dir);
+    check('Extruded helix axis along the plane normal', along > 0.995, 'cos ' + along.toFixed(4));
+    check('Extruded helix starts on the plane and grows away', Math.abs(h0) < 1.0 && h1 > 19 && h1 < 23, `first CA ${h0.toFixed(2)} Å, last ${h1.toFixed(1)} Å above`);
+    const seg = Geom.segmentAxis(res);
+    check('Segment axis of a helix is exact (PCA is not)', seg && Math.abs(V.dot(seg.u, dir)) > 0.99999, `screw-axis cos ${seg ? Math.abs(V.dot(seg.u, dir)).toFixed(6) : '—'}, PCA cos ${along.toFixed(4)}`);
+    const res2 = Builders.helix({ n: 15, conf: Geom.CONF.alpha, base, dir, inPlane: V.anyPerp(dir), phase: 0, endAtPlane: true, name: 'ALA' });
+    const e0 = V.dot(V.sub(P(res2[0], 'CA'), base), dir), e1 = V.dot(V.sub(P(res2[14], 'CA'), base), dir);
+    check('"C-terminus on plane" helix ends at the plane', Math.abs(e1) < 1.0 && e0 > 19, `first CA ${e0.toFixed(1)}, last ${e1.toFixed(2)} Å`);
+  }
+  // 7. Sheet geometry
+  {
+    const strands = Builders.sheet({ p0: [0, 0, 0], p1: [20, 0, 0], normal: [0, 0, 1], nStrands: 4, parallel: false, spacing: 4.8, side: 1, twist: 0, shift: 0 });
+    let minD = Infinity, maxD = 0;
+    for (let k = 0; k + 1 < strands.length; k++) {
+      const A = strands[k], B = strands[k + 1];
+      for (const r of A) {
+        let d = Infinity;
+        for (const q of B) d = Math.min(d, V.dist(P(r, 'CA'), P(q, 'CA')));
+        minD = Math.min(minD, d); maxD = Math.max(maxD, d);
+      }
+    }
+    check('Antiparallel sheet: CA–CA across neighbouring strands 4.2–6 Å', minD > 4.2 && maxD < 6.0, `${minD.toFixed(2)}–${maxD.toFixed(2)} Å`);
+    // Strand axes in the plane, CB alternating out of it
+    const zs = strands.flatMap(s => s.map(r => P(r, 'CA')[2]));
+    check('Strands lie on the plane', Math.max(...zs.map(Math.abs)) < 1.3, 'max |z| of CA ' + Math.max(...zs.map(Math.abs)).toFixed(2));
+    // Antiparallel H-bond partners: N-H...O distances between adjacent strands
+    let hb = 0;
+    for (let k = 0; k + 1 < strands.length; k++) for (const r of strands[k]) for (const q of strands[k + 1]) {
+      const d1 = V.dist(P(r, 'N'), P(q, 'O')), d2 = V.dist(P(r, 'O'), P(q, 'N'));
+      if (d1 < 3.3) hb++; if (d2 < 3.3) hb++;
+    }
+    check('Sheet strands make backbone N…O contacts (< 3.3 Å)', hb >= 6, hb + ' contacts');
+    const sideOf = (k, i) => Math.sign(P(strands[k][i], 'CB')[2] - P(strands[k][i], 'CA')[2]);
+    const mid0 = Math.floor((strands[0].length - 1) / 2), mid1 = strands[1].length - 1 - mid0;
+    check('Residues across from each other point the same way', sideOf(0, mid0) === sideOf(1, mid1) && sideOf(0, mid0) !== sideOf(0, mid0 + 1));
+  }
+  // 8. Torsion editing
+  {
+    const res = Geom.residuesFromBackbone(Geom.idealSegment(10, Geom.CONF.alpha).bb, 'ALA', 'H');
+    const m = Model.create(); const ch = Model.addChain(m, res);
+    Model.setTorsion(ch, 4, 'phi', -120, 'C'); Model.setTorsion(ch, 4, 'psi', 130, 'C');
+    const keep = P(ch.residues[0], 'CA').slice();
+    check('Set φ/ψ (C side moves)', near(Model.phi(ch, 4), -120, 1e-6) && near(Model.psi(ch, 4), 130, 1e-6) && near(Model.phi(ch, 6), -57.8, 1e-6), `φ ${Model.phi(ch, 4).toFixed(2)} ψ ${Model.psi(ch, 4).toFixed(2)}`);
+    Model.setTorsion(ch, 6, 'psi', 160, 'N');
+    check('Set ψ (N side moves) keeps the C side fixed', near(Model.psi(ch, 6), 160, 1e-6) && V.dist(P(ch.residues[0], 'CA'), keep) > 0.5 && bondsOK(ch) < 1e-6, 'bond error ' + bondsOK(ch).toExponential(1));
+  }
+  // 9. Extension
+  {
+    const res = Geom.residuesFromBackbone(Geom.idealSegment(5, Geom.CONF.alpha).bb, 'ALA', 'H');
+    const m = Model.create(); const ch = Model.addChain(m, res);
+    Model.extendChain(m, ch, 'C', 4, Geom.CONF.antiparallel, 'GLY');
+    Model.extendChain(m, ch, 'N', 3, Geom.CONF.ppii, 'ALA');
+    const n = ch.residues.length;
+    check('Extend C and N termini', n === 12 && near(Model.psi(ch, 9), 135, 1e-6) && near(Model.phi(ch, 1), -75, 1e-6) && bondsOK(ch) < 1e-6 && ch.residues[0].num === -2,
+      `${n} residues, numbers ${ch.residues[0].num}…${ch.residues[n - 1].num}, bond error ${bondsOK(ch).toExponential(1)}`);
+  }
+  // 10. Loop closure between two helices
+  {
+    const m = Model.create();
+    const dir = [0, 0, 1];
+    const h1 = Model.addChain(m, Builders.helix({ n: 14, conf: Geom.CONF.alpha, base: [0, 0, 0], dir, inPlane: [1, 0, 0], phase: 0, name: 'ALA' }));
+    const h2 = Model.addChain(m, Builders.helix({ n: 14, conf: Geom.CONF.alpha, base: [10, 0, 0], dir, inPlane: [1, 0, 0], phase: 0, endAtPlane: false, name: 'ALA' }));
+    // Reverse the second helix so it runs down: rebuild with endAtPlane true on a flipped direction
+    h2.residues = Builders.helix({ n: 14, conf: Geom.CONF.alpha, base: [10, 0, 19.5], dir: [0, 0, -1], inPlane: [1, 0, 0], phase: 0, name: 'ALA' }).map(r => Model.stamp(m, r));
+    const from = h1.residues[13], to = h2.residues[0];
+    const t0 = performance.now();
+    const r = Builders.closeLoop(m, from, to, 0, { name: 'ALA', restarts: 30 });
+    const dt = performance.now() - t0;
+    check('Loop closes a helix-helix gap (auto length)', r.closeRmsd < 0.15, `${r.n} residues, closure ${r.closeRmsd.toFixed(3)} Å, ${r.clashes} clashes, ${dt.toFixed(0)} ms`);
+    const merged = { residues: h1.residues.concat(r.residues.map(x => Model.stamp(m, x)), h2.residues) };
+    Model.rebuildO(merged, 13);
+    let worst = 0;
+    merged.residues.forEach((x, i) => { const n = merged.residues[i + 1]; if (n) worst = Math.max(worst, Math.abs(V.dist(P(x, 'C'), P(n, 'N')) - 1.329)); });
+    check('Closed loop: every peptide bond 1.33 Å', worst < 0.15, 'max deviation ' + worst.toFixed(3) + ' Å');
+    let rama = 0;
+    const tors = [];
+    for (let i = 13; i < 14 + r.n + 1; i++) {
+      const f = Model.phi(merged, i), s = Model.psi(merged, i);
+      tors.push(Math.round(f) + '/' + Math.round(s));
+      // 5 deg of slack at the region edges: the end anchor's phi follows from the closure, which is
+      // only exact to a few hundredths of an Angstrom.
+      const inAllowed = (f >= -175 && f <= -40) || (f >= 40 && f <= 95);
+      const psiOK = s === null || s >= -85 || s <= -165;
+      if (!inAllowed || !psiOK) rama++;
+    }
+    check('Loop φ/ψ stay in the allowed regions (αR, β, PPII, αL)', rama === 0, rama + ' outliers; ' + tors.join(' '));
+  }
+  // 10b. Hairpins: adjacent antiparallel strands joined by 2-residue turns
+  {
+    for (const name of ['ALA', 'GLY']) {
+      const m = Model.create();
+      const st = Builders.sheet({ p0: [-10, 0, 0], p1: [10, 0, 0], normal: [0, 0, 1], nStrands: 2, parallel: false, spacing: 4.8, side: 1, twist: 0, shift: 0 }).map(s => Model.addChain(m, s));
+      const r = Builders.closeLoop(m, st[0].residues[st[0].residues.length - 1], st[1].residues[0], 0, { name, restarts: 30 });
+      const ch = { residues: st[0].residues.concat(r.residues.map(x => Model.stamp(m, x)), st[1].residues) };
+      Model.rebuildO(ch, st[0].residues.length - 1);
+      const mm = Model.create(); mm.chains.push({ id: 'A', residues: ch.residues });
+      const cl = Model.clashes(mm);
+      check(`β-hairpin with ${name} loop: short turn, closed, no clashes`, r.n <= 3 && r.closeRmsd < 0.15 && cl.length === 0, `${r.n} residues, closure ${r.closeRmsd.toFixed(3)} Å, ${cl.length} contacts < 2.5 Å`);
+    }
+  }
+  // 11. Fit to a drawn curve
+  {
+    const m = Model.create();
+    const pts = []; for (let i = 0; i <= 40; i++) { const t = i / 40; pts.push([30 * t, 8 * Math.sin(t * Math.PI), 0]); }
+    const t0 = performance.now();
+    const r = Builders.fitCurve(m, { points: pts, spacing: 3.2, name: 'ALA' });
+    check('Free loop follows a drawn arc', r.fitRmsd < 1.6, `${r.n} residues, CA RMSD ${r.fitRmsd.toFixed(2)} Å, ${(performance.now() - t0).toFixed(0)} ms`);
+    // Anchored at both ends
+    const A = Model.addChain(m, Builders.helix({ n: 10, conf: Geom.CONF.alpha, base: [0, 0, 0], dir: [0, 0, 1], inPlane: [1, 0, 0], phase: 0 }));
+    const B = Model.addChain(m, Builders.helix({ n: 10, conf: Geom.CONF.alpha, base: [16, 0, 13], dir: [0, 0, 1], inPlane: [1, 0, 0], phase: 0 }));
+    const s = P(A.residues[9], 'CA'), e = P(B.residues[0], 'CA');
+    const curve = []; for (let i = 0; i <= 30; i++) { const t = i / 30; curve.push(V.add(V.lerp(s, e, t), [0, 10 * Math.sin(Math.PI * t), 0])); }
+    const r2 = Builders.fitCurve(m, { points: curve, start: A.residues[9], end: B.residues[0], prevC: P(A.residues[8], 'C'), spacing: 3.2, name: 'ALA' });
+    // Both ends of this drawing leave the helices at awkward angles (the start tangent is 106 deg
+    // from the anchor's CA->C bond), so the residues next to the anchors cannot sit on it.
+    check('Drawn loop joins two chain ends (closes; follows the drawing loosely)', r2.closeRmsd < 0.15 && r2.fitRmsd < 4.5, `${r2.n} residues, closure ${r2.closeRmsd.toFixed(3)} Å, fit ${r2.fitRmsd.toFixed(2)} Å`);
+    // Same path, start anchor only (helix B removed so the loop end is free): residues away from
+    // the anchor should sit on the drawing.
+    m.chains = m.chains.filter(c => c !== B);
+    const r3 = Builders.fitCurve(m, { points: curve, start: A.residues[9], prevC: P(A.residues[8], 'C'), spacing: 3.2, name: 'ALA' });
+    const dense = Builders.resample(curve, 0.2);
+    const off = r3.bb.map(b => Math.min(...dense.map(q => V.dist(b.CA, q))));
+    check('Drawn loop from a C-terminus follows the drawing', Math.max(...off.slice(3)) < 2.0, `${r3.n} residues, distance of each CA to the drawing: ${off.map(x => x.toFixed(1)).join(' ')} Å`);
+  }
+  // 11b. Refinement
+  {
+    const noise = (ch, amp, seed0) => {
+      let seed = seed0 || 11;
+      const rnd = () => { seed = (seed * 1103515245 + 12345) & 0x7fffffff; return seed / 0x7fffffff - 0.5; };
+      for (const r of ch.residues) for (const a of r.atoms) a.p = a.p.map(x => x + rnd() * amp);
+    };
+    const helixModel = (n, name) => {
+      const m = Model.create();
+      return { m, ch: Model.addChain(m, Geom.residuesFromBackbone(Geom.idealSegment(n, Geom.CONF.alpha).bb, name || 'LEU', 'H')) };
+    };
+
+    // Analytic gradient against finite differences.
+    {
+      const { m, ch } = helixModel(6, 'LEU');
+      noise(ch, 0.9, 7);
+      const sys = Refine.build(m, ch.residues, { hold: 0.3 });
+      const nb = Refine.nbPairs(sys);
+      const n = 3 * sys.nFree;
+      const x = new Float64Array(n), g = new Float64Array(n), xs = new Float64Array(n);
+      Refine._gather(sys, x);
+      const E = (xv, gv) => { Refine._scatter(sys, xv); return Refine._energy(sys, nb, gv); };
+      E(x, g);
+      let worst = 0;
+      for (let t = 0; t < 40; t++) {
+        const i = Math.floor(Math.random() * n), h = 1e-6;
+        xs.set(x); xs[i] = x[i] + h; const Ep = E(xs, null);
+        xs[i] = x[i] - h; const Em = E(xs, null);
+        const num = (Ep - Em) / (2 * h);
+        worst = Math.max(worst, Math.abs(num - g[i]) / Math.max(1, Math.abs(num)));
+      }
+      check('Refine: analytic gradient matches finite differences', worst < 1e-5, 'worst relative error ' + worst.toExponential(1));
+    }
+
+    // Distorted geometry is pulled back to ideal, for every residue type.
+    {
+      const bad = [];
+      for (const name of ['GLY', 'ALA', 'LEU', 'TRP', 'PRO', 'ARG']) {
+        const { m, ch } = helixModel(10, name);
+        noise(ch, 0.6, 23);
+        const rep = Refine.run(m, ch.residues, {});
+        if (rep.after.bondRms > 0.01 || rep.after.angleRms > 0.03 || rep.after.wrongChirality || rep.after.clashes)
+          bad.push(`${name} bond ${rep.after.bondRms.toFixed(3)} ang ${rep.after.angleRms.toFixed(3)} chi ${rep.after.wrongChirality} clash ${rep.after.clashes}`);
+      }
+      check('Refine: 0.6 Å of noise regularised for every residue type', !bad.length, bad.join('; ') || 'bonds < 0.01 Å, angles < 0.03 Å, L-chirality kept, no clashes');
+    }
+
+    // Side chains ride along with the backbone and keep the rotamer they were handed.
+    {
+      const { m, ch } = helixModel(8, 'LEU');
+      noise(ch, 0.4, 5);
+      const given = ch.residues.map(r => Geom.chiAngles(r));   // the rotamer refinement is told to keep
+      Refine.run(m, ch.residues, {});
+      let worst = 0;
+      ch.residues.forEach((r, i) => Geom.chiAngles(r).forEach((c, k) => { worst = Math.max(worst, Math.abs(V.wrap(c - given[i][k]))); }));
+      check('Refine: side chains keep the rotamer they were given', worst < 12, 'largest χ change ' + worst.toFixed(1) + '°');
+    }
+
+    // Residues outside the selection are context: they push, but never move.
+    {
+      const m = Model.create();
+      const A = Model.addChain(m, Builders.helix({ n: 12, conf: Geom.CONF.alpha, base: [0, 0, 0], dir: [0, 0, 1], inPlane: [1, 0, 0], phase: 0 }));
+      const B = Model.addChain(m, Builders.helix({ n: 12, conf: Geom.CONF.alpha, base: [5, 0, 0], dir: [0, 0, 1], inPlane: [1, 0, 0], phase: 0 }));
+      const held = B.residues.map(r => r.atoms.map(a => a.p.slice()));
+      const clashBefore = Model.clashes(m).length;
+      const rep = Refine.run(m, A.residues, {});
+      let moved = 0;
+      B.residues.forEach((r, i) => r.atoms.forEach((a, k) => { moved = Math.max(moved, V.dist(a.p, held[i][k])); }));
+      check('Refine: clashing helices separated, unselected chain untouched',
+        clashBefore > 20 && Model.clashes(m).length === 0 && moved === 0 && rep.after.bondRms < 0.01,
+        `${clashBefore} clashes → ${Model.clashes(m).length}, context moved ${moved.toFixed(3)} Å, selection moved ${rep.rmsd.toFixed(2)} Å RMS`);
+    }
+
+    // Chain breaks: close what can be closed, report what cannot.
+    {
+      const rows = [];
+      let ok = true;
+      for (const push of [2.5, 3.5, 7.0]) {
+        const { m, ch } = helixModel(16, 'ALA');
+        const dir = V.norm(V.sub(P(ch.residues[15], 'CA'), P(ch.residues[0], 'CA')));
+        for (let i = 8; i < 16; i++) Model.moveAtoms(ch.residues[i].atoms, p => V.addScaled(p, dir, push));
+        const gap = V.dist(P(ch.residues[7], 'C'), P(ch.residues[8], 'N'));
+        const rep = Refine.run(m, ch.residues, {});
+        const left = Model.chainBreaks(m).length;
+        rows.push(`${gap.toFixed(1)} Å → ` + (rep.closed.length ? rep.closed[0].now.toFixed(2) + ' Å' : 'left open'));
+        if (gap <= 4) ok = ok && rep.closed.length === 1 && left === 0 && rep.after.bondRms < 0.01;
+        else ok = ok && rep.closed.length === 0 && rep.skippedBreaks.length === 1 && left === 1;
+      }
+      check('Refine: closes gaps up to the limit, reports wider ones', ok, rows.join(', '));
+    }
+
+    // A backbone-only template (no side chains at all) still refines.
+    {
+      const { m, ch } = helixModel(10, 'LEU');
+      Model.convertResidues(ch.residues, 'backbone', true);
+      noise(ch, 0.5, 31);
+      const rep = Refine.run(m, ch.residues, {});
+      const atomsKept = ch.residues.every(r => r.atoms.length === 4);
+      check('Refine: backbone-only model regularises without growing side chains',
+        atomsKept && rep.after.bondRms < 0.01 && rep.after.angleRms < 0.03,
+        `bonds ${rep.after.bondRms.toFixed(4)} Å, angles ${rep.after.angleRms.toFixed(4)} Å, ${ch.residues[0].atoms.length} atoms/residue`);
+    }
+
+    // Repacking: the rotamer library builds, and chi combinations that hit their own backbone go.
+    {
+      const bad = [];
+      for (const name of Object.keys(Pack.CHI)) {
+        const { ch } = helixModel(3, name);
+        const res = ch.residues[1];
+        const close = Pack.topology(name);
+        if (!close.has('CB|CA') || !close.has('CB|N')) bad.push(name + ' topology');
+        let built = 0;
+        for (const chi of Pack.CHI[name][0].map(c => [c].concat(Pack.CHI[name].slice(1).map(l => l[0])))) {
+          const atoms = Pack.placeRotamer(res, chi);
+          if (atoms && atoms.length === Geom.SC[name].atoms.length) built++;
+        }
+        if (built !== 3) bad.push(`${name} built ${built}/3`);
+      }
+      check('Repack: rotamer library builds for every type', !bad.length, bad.join('; ') || Object.keys(Pack.CHI).length + ' types, χ1 wells all build');
+    }
+
+    // The point of repacking: clear side-chain clashes without having to move the backbone.
+    {
+      const build2 = (name, sep) => {
+        const m = Model.create();
+        const A = Model.addChain(m, Builders.helix({ n: 14, conf: Geom.CONF.alpha, base: [0, 0, 0], dir: [0, 0, 1], inPlane: [1, 0, 0], phase: 0, name }));
+        const B = Model.addChain(m, Builders.helix({ n: 14, conf: Geom.CONF.alpha, base: [sep, 0, 0], dir: [0, 0, 1], inPlane: [1, 0, 0], phase: 180, name }));
+        return { m, rs: A.residues.concat(B.residues), chains: [A, B] };
+      };
+      const bbMove = (chains, snap) => {
+        let s = 0, n = 0;
+        chains.forEach((ch, ci) => ch.residues.forEach((r, i) => {
+          for (const nm of ['N', 'CA', 'C', 'O']) { const p = Geom.pos(r, nm), o = snap[ci][i][nm]; if (p && o) { s += V.dist2(p, o); n++; } }
+        }));
+        return Math.sqrt(s / n);
+      };
+      const snapOf = chains => chains.map(ch => ch.residues.map(r => Object.fromEntries(r.atoms.map(a => [a.name, a.p.slice()]))));
+      const rows = [];
+      let ok = true;
+      for (const name of ['LEU', 'TRP', 'ARG']) {
+        const a = build2(name, 9.0), b = build2(name, 9.0);
+        const sa = snapOf(a.chains), sb = snapOf(b.chains);
+        const ra = Refine.run(a.m, a.rs, { sideMode: 'ideal' });
+        const rb = Refine.run(b.m, b.rs, { sideMode: 'repack' });
+        const ma = bbMove(a.chains, sa), mb = bbMove(b.chains, sb);
+        rows.push(`${name}: backbone moved ${ma.toFixed(2)} Å rigid vs ${mb.toFixed(2)} Å repacked, ${rb.pack.changed} rotamers changed`);
+        ok = ok && rb.after.clashes === 0 && ra.after.clashes === 0 && mb < ma * 0.75 && rb.pack.changed > 0;
+      }
+      check('Repack: clashes cleared with far less backbone movement', ok, rows.join('; '));
+    }
+
+    // A disulfide is not something the packer may rotate out of.
+    {
+      const m = Model.create();
+      const A = Model.addChain(m, Builders.helix({ n: 8, conf: Geom.CONF.alpha, base: [0, 0, 0], dir: [0, 0, 1], inPlane: [1, 0, 0], phase: 0, name: 'CYS' }));
+      // Put two cysteines in contact and bond them.
+      const B = Model.addChain(m, Builders.helix({ n: 8, conf: Geom.CONF.alpha, base: [8.5, 0, 0], dir: [0, 0, 1], inPlane: [1, 0, 0], phase: 180, name: 'CYS' }));
+      let best = null;
+      for (const x of A.residues) for (const y of B.residues) {
+        const d = V.dist(P(x, 'SG'), P(y, 'SG'));
+        if (!best || d < best.d) best = { x, y, d };
+      }
+      // Pull the two SG atoms onto a 2.03 Å bond.
+      const mid = V.lerp(P(best.x, 'SG'), P(best.y, 'SG'), 0.5);
+      const dir = V.norm(V.sub(P(best.y, 'SG'), P(best.x, 'SG')));
+      Geom.getAtom(best.x, 'SG').p = V.addScaled(mid, dir, -1.015);
+      Geom.getAtom(best.y, 'SG').p = V.addScaled(mid, dir, 1.015);
+      const pr = Pack.run(m, A.residues.concat(B.residues), {});
+      const after = V.dist(P(best.x, 'SG'), P(best.y, 'SG'));
+      check('Repack: a disulfide is left alone, not rotated apart', pr.committed >= 2 && Math.abs(after - 2.03) < 0.01,
+        `${pr.committed} side chain(s) held, S–S ${after.toFixed(2)} Å`);
+    }
+
+    // Repacking an already-good structure barely touches it.
+    {
+      const { m, ch } = helixModel(12, 'LEU');
+      const chi0 = ch.residues.map(r => Geom.chiAngles(r));
+      const pr = Pack.run(m, ch.residues, {});
+      let moved = 0;
+      ch.residues.forEach((r, i) => Geom.chiAngles(r).forEach((c, k) => { if (Math.abs(V.wrap(c - chi0[i][k])) > 20) moved++; }));
+      check('Repack: a clash-free structure is left as it is', pr.changed === 0 && moved === 0, `${pr.changed} of ${pr.sites} changed`);
+    }
+
+    // φ is pushed out of the band no non-glycine residue can occupy.
+    {
+      const { m, ch } = helixModel(12, 'ALA');
+      Model.setTorsion(ch, 6, 'phi', 5, 'C');
+      const a0 = Refine.analyse(m, ch.residues, {});
+      const rep = Refine.run(m, ch.residues, {});
+      check('Refine: φ pushed out of the forbidden band', a0.rama.length === 1 && rep.after.rama.length === 0,
+        `φ(7) ${a0.rama.length ? a0.rama[0].phi.toFixed(0) : '—'}° → ${Model.phi(ch, 6).toFixed(0)}°`);
+    }
+  }
+
+  // 12. PDB / mmCIF round trips and import of 1CRN
+  {
+    const text = await fetch('1crn.pdb').then(r => r.text());
+    const m = IO.parsePDB(text);
+    const n = m.chains.reduce((s, c) => s + c.residues.length, 0);
+    const hel = m.chains[0].residues.filter(r => r.ss === 'H').length, str = m.chains[0].residues.filter(r => r.ss === 'E').length;
+    check('Import 1CRN: one chain, 46 residues, SS from HELIX/SHEET', m.chains.length === 1 && n === 46 && hel > 10 && str > 4, `${m.chains.length} chain(s), ${n} residues, ${hel} H, ${str} E`);
+    const back = IO.parsePDB(IO.toPDB(m));
+    let maxd = 0, same = true;
+    m.chains[0].residues.forEach((r, i) => {
+      const q = back.chains[0].residues[i];
+      if (!q || q.name !== r.name || q.num !== r.num || q.ss !== r.ss) same = false;
+      for (const a of r.atoms) { const b = Geom.getAtom(q, a.name); if (!b) { same = false; continue; } maxd = Math.max(maxd, V.dist(a.p, b.p)); }
+    });
+    check('PDB write → read round trip', same && maxd < 0.001, 'max coordinate change ' + maxd.toFixed(4) + ' Å');
+    const cif = IO.parseCIF(IO.toCIF(m));
+    let maxc = 0, samec = cif.chains.length === 1 && cif.chains[0].residues.length === 46;
+    m.chains[0].residues.forEach((r, i) => { const q = cif.chains[0].residues[i]; if (!q) return; for (const a of r.atoms) { const b = Geom.getAtom(q, a.name); if (b) maxc = Math.max(maxc, V.dist(a.p, b.p)); else samec = false; } });
+    check('mmCIF write → read round trip', samec && maxc < 0.001, 'max coordinate change ' + maxc.toFixed(4) + ' Å');
+    const bbtext = IO.toPDB(m, { backboneOnly: true });
+    const names = new Set(bbtext.split('\n').filter(l => l.startsWith('ATOM')).map(l => l.slice(12, 16).trim()));
+    check('Backbone-only export writes N, CA, C, O', names.size === 4 && ['N', 'CA', 'C', 'O'].every(x => names.has(x)), [...names].join(' '));
+    // Refining a crystal structure: geometry improves, the fold and the disulfides stay put.
+    {
+      const cm = IO.parsePDB(text);
+      const start = cm.chains[0].residues.map(r => Object.fromEntries(r.atoms.map(a => [a.name, a.p.slice()])));
+      const cys = cm.chains[0].residues.filter(r => r.name === 'CYS');
+      const ss = () => { const o = []; for (let i = 0; i < cys.length; i++) for (let j = i + 1; j < cys.length; j++) { const d = V.dist(Geom.pos(cys[i], 'SG'), Geom.pos(cys[j], 'SG')); if (d < 3.0) o.push(d); } return o; };
+      const ssBefore = ss().length;
+      const t0 = performance.now();
+      const rep = Refine.run(cm, cm.chains[0].residues, {});
+      const ms = performance.now() - t0;
+      let s = 0, n = 0, mx = 0;
+      cm.chains[0].residues.forEach((r, i) => r.atoms.forEach(a => {
+        const o = start[i][a.name]; if (!o) return;
+        const d = V.dist2(a.p, o); s += d; n++; mx = Math.max(mx, d);
+      }));
+      const rmsd = Math.sqrt(s / n), ssAfter = ss();
+      check('Refine 1CRN: geometry improves, fold and disulfides preserved',
+        rep.after.bondRms < 0.005 && rep.before.bondRms > 0.02 && rmsd < 0.3 && Math.sqrt(mx) < 1.0 &&
+        ssBefore === 3 && ssAfter.length === 3 && ssAfter.every(d => Math.abs(d - 2.03) < 0.05) &&
+        !rep.after.rama.length && !rep.after.wrongChirality,
+        `bonds ${rep.before.bondRms.toFixed(3)} → ${rep.after.bondRms.toFixed(4)} Å, moved ${rmsd.toFixed(3)} Å RMS (max ${Math.sqrt(mx).toFixed(2)}), 3 S–S at ${ssAfter.map(d => d.toFixed(2)).join('/')} Å, ${ms.toFixed(0)} ms`);
+    }
+    Model.convertResidues(m.chains[0].residues, 'ala');
+    const allAla = m.chains[0].residues.every(r => r.name === 'ALA' && r.atoms.length === 5 || (r.atoms.length === 6 && Geom.getAtom(r, 'OXT')));
+    check('Poly-ALA conversion keeps backbone + CB', allAla);
+    // A minimal hand-written mmCIF with quoted atom names and a second model.
+    const mini = `data_x
+loop_
+_atom_site.group_PDB
+_atom_site.id
+_atom_site.type_symbol
+_atom_site.label_atom_id
+_atom_site.label_alt_id
+_atom_site.label_comp_id
+_atom_site.label_asym_id
+_atom_site.label_seq_id
+_atom_site.Cartn_x
+_atom_site.Cartn_y
+_atom_site.Cartn_z
+_atom_site.auth_seq_id
+_atom_site.auth_asym_id
+_atom_site.pdbx_PDB_model_num
+ATOM 1 N N . GLY A 1 0.000 0.000 0.000 5 B 1
+ATOM 2 C CA . GLY A 1 1.458 0.000 0.000 5 B 1
+ATOM 3 C C . GLY A 1 2.009 1.420 0.000 5 B 1
+ATOM 4 O O . GLY A 1 1.246 2.390 0.000 5 B 1
+HETATM 5 C "C1'" . NAG C . 5.0 5.0 5.0 101 B 1
+ATOM 6 N N . GLY A 1 9.000 0.000 0.000 5 B 2
+#
+`;
+    const mm = IO.parseCIF(mini);
+    check('mmCIF: auth chain/number, quoted names, first model only, ligand split off',
+      mm.chains.length === 1 && mm.chains[0].id === 'B' && mm.chains[0].residues[0].num === 5 && mm.chains[0].residues[0].atoms.length === 4 && mm.ligands.length === 1 && mm.ligands[0].atoms[0].name === "C1'");
+  }
+
+  const nf = results.filter(r => !r.ok).length;
+  document.getElementById('summary').innerHTML = nf ? `<span class="fail">${nf} of ${results.length} failed</span>` : `<span class="ok">All ${results.length} passed</span>`;
+  document.getElementById('out').innerHTML = results.map(r => `<tr><td class="${r.ok ? 'ok' : 'fail'}">${r.ok ? 'PASS' : 'FAIL'}</td><td>${r.name}</td><td class="d">${r.detail}</td></tr>`).join('');
+  window.testResults = results;
+}
+run().catch(e => { document.getElementById('summary').innerHTML = '<span class="fail">Error: ' + e.message + '</span>'; console.error(e); });
+</script>
+</body>
+</html>
